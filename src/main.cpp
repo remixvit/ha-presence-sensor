@@ -36,7 +36,8 @@ DoorLogic door;
 
 #ifdef USE_VL53
 VL53L1X   vl53;
-bool      vl53ok = false;
+bool      vl53ok     = false;
+volatile bool vl53Failed = false;  // runtime-сбой: датчик перестал отвечать
 #endif
 
 // ============================================================
@@ -294,46 +295,80 @@ void buildUI(sets::Builder& b) {
 void sensorTask(void*) {
     esp_task_wdt_add(NULL);  // регистрируем таск в TWDT
 
-    TickType_t    lastWake   = xTaskGetTickCount();
-    unsigned long lastSecond = 0;
+    TickType_t    lastWake      = xTaskGetTickCount();
+    unsigned long lastSecond    = 0;
+    uint8_t       heartbeatTick = 0;
+
+#ifdef USE_VL53
+    unsigned long lastVl53Read  = millis();  // время последнего успешного чтения
+#endif
 
     while (true) {
-        esp_task_wdt_reset();  // сбрасываем WDT каждые 50мс
+        esp_task_wdt_reset();
+
+        // ── Heartbeat LED — мигает каждые 500мс (10 тиков × 50мс) ──
+        if (++heartbeatTick >= 10) {
+            heartbeatTick = 0;
+            digitalWrite(LED_HEARTBEAT_PIN, !digitalRead(LED_HEARTBEAT_PIN));
+        }
+
         // ── LD2410C — опрос каждые 50мс ──────────────────────
         sensor.update();
         const LD2410Data& d = sensor.data();
 
-        // Обновляем снимок
-        snap.presence    = d.presence();
-        snap.isMoving    = d.isMoving();
-        snap.isStatic    = d.isStatic();
-        snap.movingDist  = d.movingDist;
-        snap.staticDist  = d.staticDist;
+        snap.presence     = d.presence();
+        snap.isMoving     = d.isMoving();
+        snap.isStatic     = d.isStatic();
+        snap.movingDist   = d.movingDist;
+        snap.staticDist   = d.staticDist;
         snap.movingEnergy = d.movingEnergy;
 
 #ifdef USE_VL53
         // ── VL53L1X — неблокирующее чтение ───────────────────
-        if (vl53ok && vl53.dataReady()) {
-            vl53.read(false);
-            if (!vl53.timeoutOccurred()) {
-                snap.vl53dist   = vl53.ranging_data.range_mm;
-                snap.zoneBlocked = snap.vl53dist < cfg_vl53Threshold;
-                digitalWrite(DOOR_ZONE_PIN, snap.zoneBlocked ? HIGH : LOW);
+        if (vl53ok && !vl53Failed) {
+            if (vl53.dataReady()) {
+                vl53.read(false);
+                if (!vl53.timeoutOccurred()) {
+                    lastVl53Read     = millis();
+                    snap.vl53dist    = vl53.ranging_data.range_mm;
+                    snap.zoneBlocked = snap.vl53dist < cfg_vl53Threshold;
+                    digitalWrite(DOOR_ZONE_PIN, snap.zoneBlocked ? HIGH : LOW);
+                }
+            }
+            // 3 секунды без данных → аварийный режим
+            if (millis() - lastVl53Read > 3000) {
+                vl53Failed       = true;
+                snap.zoneBlocked = false;
+                digitalWrite(DOOR_ZONE_PIN, LOW);
+                Serial.println("[VL53] Датчик не отвечает — аварийный режим");
             }
         }
 #endif
+
+        // ── Error LED ─────────────────────────────────────────
+        bool anyError = false;
+#ifdef USE_VL53
+        anyError = vl53Failed;
+#endif
+        digitalWrite(LED_ERROR_PIN, anyError ? HIGH : LOW);
 
         // ── Логика двери — раз в секунду ─────────────────────
         unsigned long now = millis();
         if (now - lastSecond >= 1000) {
             lastSecond = now;
+
+            // Если VL53 сломан — гарантируем минимальную задержку закрытия 1.5с
+            uint32_t safeCloseDelay = cfg_closeDelay;
+#ifdef USE_VL53
+            if (vl53Failed && safeCloseDelay < 1500) safeCloseDelay = 1500;
+#endif
             door.update(
                 d.movingDist,
                 d.presence(),
                 snap.zoneBlocked,
                 cfg_approachDelta,
                 cfg_openDist,
-                cfg_closeDelay
+                safeCloseDelay
             );
             snap.doorOpen = door.isDoorOpen();
             snap.moveDir  = (uint8_t)door.direction();
@@ -383,6 +418,10 @@ void setup() {
     pinMode(DOOR_OPEN_PIN, OUTPUT);  digitalWrite(DOOR_OPEN_PIN, LOW);
     pinMode(DOOR_ZONE_PIN, OUTPUT);  digitalWrite(DOOR_ZONE_PIN, LOW);
     door.begin(DOOR_OPEN_PIN);
+
+    // Индикация
+    pinMode(LED_HEARTBEAT_PIN, OUTPUT);  digitalWrite(LED_HEARTBEAT_PIN, LOW);
+    pinMode(LED_ERROR_PIN,     OUTPUT);  digitalWrite(LED_ERROR_PIN,     LOW);
 
 #ifdef USE_VL53
     Wire.begin(VL53_SDA_PIN, VL53_SCL_PIN);
@@ -587,9 +626,11 @@ void loop() {
 #endif
 
 #ifdef USE_VL53
-        String vVl53    = vl53ok
-            ? (String(snap.vl53dist) + " мм  — " + (snap.zoneBlocked ? "ЗАНЯТ" : "свободен"))
-            : "датчик не найден";
+        String vVl53 = !vl53ok
+            ? "ОШИБКА: датчик не найден при старте"
+            : vl53Failed
+                ? "ОШИБКА: датчик не отвечает (задержка закрытия ≥1.5с)"
+                : (String(snap.vl53dist) + " мм  — " + (snap.zoneBlocked ? "ЗАНЯТ" : "свободен"));
         String vZoneOut = snap.zoneBlocked ? "АКТИВЕН" : "неактивен";
         db[kk::lbl_vl53]   = vVl53;
         db[kk::lbl_static] = vZoneOut;

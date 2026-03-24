@@ -16,3 +16,7 @@
 // Выходы на оптопары PC817 → контроллер двери
 #define DOOR_OPEN_PIN   8  // GPIO8 — "открыть дверь" (приближение по LD2410C)
 #define DOOR_ZONE_PIN   9  // GPIO9 — "человек в проёме" (VL53L1X)
+
+// Индикация
+#define LED_HEARTBEAT_PIN  4  // GPIO4 — мигает каждые 500мс (устройство живо)
+#define LED_ERROR_PIN      5  // GPIO5 — горит при ошибке сенсора
