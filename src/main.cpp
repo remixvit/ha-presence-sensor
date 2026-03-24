@@ -2,6 +2,7 @@
 #include <WiFi.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
 #include <GyverDBFile.h>
 #include <SettingsGyverWS.h>
@@ -291,10 +292,13 @@ void buildUI(sets::Builder& b) {
 //  Всегда работает независимо от WiFi/MQTT
 // ============================================================
 void sensorTask(void*) {
+    esp_task_wdt_add(NULL);  // регистрируем таск в TWDT
+
     TickType_t    lastWake   = xTaskGetTickCount();
     unsigned long lastSecond = 0;
 
     while (true) {
+        esp_task_wdt_reset();  // сбрасываем WDT каждые 50мс
         // ── LD2410C — опрос каждые 50мс ──────────────────────
         sensor.update();
         const LD2410Data& d = sensor.data();
@@ -383,6 +387,7 @@ void setup() {
 #ifdef USE_VL53
     Wire.begin(VL53_SDA_PIN, VL53_SCL_PIN);
     Wire.setClock(100000);
+    Wire.setTimeOut(10);  // 10мс макс на I2C транзакцию — защита от lockup
     delay(200);
     vl53.setTimeout(500);
     vl53ok = vl53.init();
@@ -499,6 +504,12 @@ void setup() {
         ""
 #endif
     );
+
+    // Task Watchdog — 5 сек, при срабатывании паника → ресет
+    {
+        const esp_task_wdt_config_t wdt_cfg = { .timeout_ms = 5000, .idle_core_mask = 0, .trigger_panic = true };
+        esp_task_wdt_reconfigure(&wdt_cfg);
+    }
 
     // Запуск сенсорного таска — в самом конце setup()
     xTaskCreatePinnedToCore(
