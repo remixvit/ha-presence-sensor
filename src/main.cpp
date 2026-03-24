@@ -362,19 +362,32 @@ void sensorTask(void*) {
         }
 #endif
 
-        // ── Error LED — мигает при любой ошибке ──────────────
-        bool anyError = ld2410Failed;
+        // ── Error LED ─────────────────────────────────────────
+        // Оба сломаны  → постоянно горит
+        // Только LD2410 → 10Гц  (toggle каждый тик, 50мс период)
+        // Только VL53   → 2Гц   (toggle каждые 5 тиков, 250мс период)
+        // Нет ошибок    → выключен
+        {
+            bool vl53Err = false;
 #ifdef USE_VL53
-        anyError |= vl53Failed;
+            vl53Err = vl53Failed;
 #endif
-        if (anyError) {
-            if (++errorBlinkTick >= 5) {  // мигание 2Гц (5 тиков × 50мс = 250мс)
+            if (ld2410Failed && vl53Err) {
                 errorBlinkTick = 0;
+                digitalWrite(LED_ERROR_PIN, HIGH);
+            } else if (ld2410Failed) {
+                // 10Гц — переключаем каждый тик (50мс)
                 digitalWrite(LED_ERROR_PIN, !digitalRead(LED_ERROR_PIN));
+            } else if (vl53Err) {
+                // 2Гц — переключаем каждые 5 тиков (250мс)
+                if (++errorBlinkTick >= 5) {
+                    errorBlinkTick = 0;
+                    digitalWrite(LED_ERROR_PIN, !digitalRead(LED_ERROR_PIN));
+                }
+            } else {
+                errorBlinkTick = 0;
+                digitalWrite(LED_ERROR_PIN, LOW);
             }
-        } else {
-            errorBlinkTick = 0;
-            digitalWrite(LED_ERROR_PIN, LOW);
         }
 
         // ── Логика двери — раз в секунду ─────────────────────
