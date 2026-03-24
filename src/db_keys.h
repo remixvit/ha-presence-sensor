@@ -47,5 +47,6 @@ DB_KEYS(kk,
     lbl_stat_dist,
     lbl_energy,
     lbl_vl53,
-    lbl_door
+    lbl_door,
+    lbl_ld2410
 );

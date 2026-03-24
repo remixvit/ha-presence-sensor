@@ -36,9 +36,11 @@ DoorLogic door;
 
 #ifdef USE_VL53
 VL53L1X   vl53;
-bool      vl53ok     = false;
+bool      vl53ok         = false;
 volatile bool vl53Failed = false;  // runtime-сбой: датчик перестал отвечать
 #endif
+
+volatile bool ld2410Failed = false;  // LD2410C перестал слать фреймы
 
 // ============================================================
 //  Снимок данных сенсоров — пишет sensorTask, читает loop
@@ -225,6 +227,7 @@ void buildUI(sets::Builder& b) {
 #ifdef USE_MQTT
         b.Label(kk::lbl_mqtt,      "MQTT");
 #endif
+        b.Label(kk::lbl_ld2410,    "Радар LD2410C");
         b.Label(kk::lbl_mov_dist,  "Расстояние до объекта");
         b.Label(kk::lbl_door,      "Направление движения");
 #ifdef USE_VL53
@@ -293,35 +296,50 @@ void buildUI(sets::Builder& b) {
 //  Всегда работает независимо от WiFi/MQTT
 // ============================================================
 void sensorTask(void*) {
-    esp_task_wdt_add(NULL);  // регистрируем таск в TWDT
+    esp_task_wdt_add(NULL);
 
-    TickType_t    lastWake      = xTaskGetTickCount();
-    unsigned long lastSecond    = 0;
-    uint8_t       heartbeatTick = 0;
+    TickType_t    lastWake        = xTaskGetTickCount();
+    unsigned long lastSecond      = 0;
+    uint8_t       heartbeatTick   = 0;
+    uint8_t       errorBlinkTick  = 0;
+    unsigned long lastLd2410Frame = millis();
 
 #ifdef USE_VL53
-    unsigned long lastVl53Read  = millis();  // время последнего успешного чтения
+    unsigned long lastVl53Read    = millis();
 #endif
 
     while (true) {
         esp_task_wdt_reset();
 
-        // ── Heartbeat LED — мигает каждые 500мс (10 тиков × 50мс) ──
+        // ── Heartbeat LED — мигает каждые 500мс ──────────────
         if (++heartbeatTick >= 10) {
             heartbeatTick = 0;
             digitalWrite(LED_HEARTBEAT_PIN, !digitalRead(LED_HEARTBEAT_PIN));
         }
 
         // ── LD2410C — опрос каждые 50мс ──────────────────────
-        sensor.update();
+        if (sensor.update()) lastLd2410Frame = millis();
+
         const LD2410Data& d = sensor.data();
 
-        snap.presence     = d.presence();
-        snap.isMoving     = d.isMoving();
-        snap.isStatic     = d.isStatic();
-        snap.movingDist   = d.movingDist;
-        snap.staticDist   = d.staticDist;
-        snap.movingEnergy = d.movingEnergy;
+        if (!ld2410Failed) {
+            snap.presence     = d.presence();
+            snap.isMoving     = d.isMoving();
+            snap.isStatic     = d.isStatic();
+            snap.movingDist   = d.movingDist;
+            snap.staticDist   = d.staticDist;
+            snap.movingEnergy = d.movingEnergy;
+
+            if (millis() - lastLd2410Frame > 3000) {
+                ld2410Failed   = true;
+                snap.presence  = false;
+                snap.isMoving  = false;
+                snap.isStatic  = false;
+                snap.movingDist = snap.staticDist = snap.movingEnergy = 0;
+                digitalWrite(DOOR_OPEN_PIN, LOW);
+                Serial.println("[LD2410] Датчик не отвечает — аварийный режим");
+            }
+        }
 
 #ifdef USE_VL53
         // ── VL53L1X — неблокирующее чтение ───────────────────
@@ -335,7 +353,6 @@ void sensorTask(void*) {
                     digitalWrite(DOOR_ZONE_PIN, snap.zoneBlocked ? HIGH : LOW);
                 }
             }
-            // 3 секунды без данных → аварийный режим
             if (millis() - lastVl53Read > 3000) {
                 vl53Failed       = true;
                 snap.zoneBlocked = false;
@@ -345,26 +362,34 @@ void sensorTask(void*) {
         }
 #endif
 
-        // ── Error LED ─────────────────────────────────────────
-        bool anyError = false;
+        // ── Error LED — мигает при любой ошибке ──────────────
+        bool anyError = ld2410Failed;
 #ifdef USE_VL53
-        anyError = vl53Failed;
+        anyError |= vl53Failed;
 #endif
-        digitalWrite(LED_ERROR_PIN, anyError ? HIGH : LOW);
+        if (anyError) {
+            if (++errorBlinkTick >= 5) {  // мигание 2Гц (5 тиков × 50мс = 250мс)
+                errorBlinkTick = 0;
+                digitalWrite(LED_ERROR_PIN, !digitalRead(LED_ERROR_PIN));
+            }
+        } else {
+            errorBlinkTick = 0;
+            digitalWrite(LED_ERROR_PIN, LOW);
+        }
 
         // ── Логика двери — раз в секунду ─────────────────────
         unsigned long now = millis();
         if (now - lastSecond >= 1000) {
             lastSecond = now;
 
-            // Если VL53 сломан — гарантируем минимальную задержку закрытия 1.5с
             uint32_t safeCloseDelay = cfg_closeDelay;
 #ifdef USE_VL53
             if (vl53Failed && safeCloseDelay < 1500) safeCloseDelay = 1500;
 #endif
+            // При сбое LD2410 передаём нули — дверь не откроется, таймер закроет
             door.update(
-                d.movingDist,
-                d.presence(),
+                ld2410Failed ? 0           : d.movingDist,
+                ld2410Failed ? false       : d.presence(),
                 snap.zoneBlocked,
                 cfg_approachDelta,
                 cfg_openDist,
@@ -606,15 +631,18 @@ void loop() {
             : "объектов нет";
         String vWifi    = WiFi.localIP().toString();
         String vDir     = door.directionStr();
-        String vDoorOut = snap.doorOpen   ? "АКТИВЕН" : "неактивен";
+        String vDoorOut = snap.doorOpen ? "АКТИВЕН" : "неактивен";
+        String vLd2410  = ld2410Failed  ? "ОШИБКА: датчик не отвечает" : "OK";
 
-        db[kk::lbl_wifi]     = vWifi;
-        db[kk::lbl_mov_dist] = vDist;
-        db[kk::lbl_door]     = vDir;
-        db[kk::lbl_presence] = vDoorOut;
+        db[kk::lbl_wifi]    = vWifi;
+        db[kk::lbl_ld2410]  = vLd2410;
+        db[kk::lbl_mov_dist]= vDist;
+        db[kk::lbl_door]    = vDir;
+        db[kk::lbl_presence]= vDoorOut;
 
         auto upd = sett.updater()
             .update(kk::lbl_wifi,     vWifi)
+            .update(kk::lbl_ld2410,   vLd2410)
             .update(kk::lbl_mov_dist, vDist)
             .update(kk::lbl_door,     vDir)
             .update(kk::lbl_presence, vDoorOut);
