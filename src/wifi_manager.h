@@ -205,10 +205,11 @@ private:
 
     void _launchAP(const char* reason) {
         _state = State::APOnly;
-        WiFi.disconnect(true);
-        WiFi.mode(WIFI_AP);
-        WiFi.setTxPower(_txPower);
+        // Не вызываем WiFi.disconnect(true)/WiFi.mode() из loop() —
+        // на одноядерном ESP32-C3 это может конфликтовать с WiFi-стеком.
+        // Просто поднимаем AP поверх текущего состояния.
         WiFi.softAP(_apName.c_str(), _apPass.c_str());
+        WiFi.setTxPower(_txPower);
         _apActive = true;
         Serial.printf("[WiFi] AP '%s' запущена (причина: %s), IP: %s\n",
             _apName.c_str(), reason, WiFi.softAPIP().toString().c_str());
@@ -217,8 +218,12 @@ private:
 
     void _closeAP() {
         if (!_apActive) return;
+        // НЕ меняем WiFi.mode() здесь — на ESP32-C3 один физический
+        // процессор, вызов mode() из loop() пока WiFi-стек обрабатывает
+        // события connect приводит к Store access fault (Core 0 panic).
+        // softAPdisconnect(true) физически останавливает AP,
+        // режим AP_STA остаётся — это нормально.
         WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_STA);
         WiFi.setTxPower(_txPower);
         _apActive = false;
         Serial.println("[WiFi] AP закрыта");
