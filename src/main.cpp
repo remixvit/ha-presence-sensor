@@ -6,7 +6,7 @@
 
 #include <GyverDBFile.h>
 #include <SettingsGyverWS.h>
-#include <WiFiConnector.h>
+#include "wifi_manager.h"
 
 #ifdef USE_MQTT
 #include <PubSubClient.h>
@@ -166,7 +166,7 @@ void publishDiscovery() {
 
 bool connectMQTT() {
     if (mqttClient.connected()) return true;
-    if (!WiFiConnector.connected()) return false;
+    if (!wifiMgr.connected()) return false;
 
     String   broker = (String)db[kk::mqtt_broker];
     uint16_t port   = (int)db[kk::mqtt_port];
@@ -246,7 +246,7 @@ void buildUI(sets::Builder& b) {
         b.Pass (kk::wifi_pass, "Пароль сети", "***");
         if (b.Button(kk::wifi_apply, "Подключиться")) {
             db.update();
-            WiFiConnector.connect(db[kk::wifi_ssid], db[kk::wifi_pass]);
+            wifiMgr.reconnect(db[kk::wifi_ssid], db[kk::wifi_pass]);
         }
     }
 
@@ -480,7 +480,7 @@ void setup() {
     sensor.begin(Serial1, LD2410_RX_PIN, LD2410_TX_PIN, LD2410_OUT_PIN);
     Serial.printf("[LD2410] RX=%d TX=%d OUT=%d\n", LD2410_RX_PIN, LD2410_TX_PIN, LD2410_OUT_PIN);
 
-    // WiFi события для диагностики
+    // WiFi события → передаём в wifiMgr
     WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
         switch (event) {
             case ARDUINO_EVENT_WIFI_STA_CONNECTED:
@@ -494,81 +494,39 @@ void setup() {
                     r == 200 ? "AP пропала"      :
                     r == 201 ? "AP не найдена"   : "другая";
                 Serial.printf("[WiFi] Разрыв, причина %d: %s\n", r, txt);
+                wifiMgr.notifyDisconnect();  // триггерим переподключение
                 break;
             }
             default: break;
         }
     });
 
-    WiFiConnector.onConnect([]() {
-        Serial.printf("[WiFi] Подключён: %s\n", WiFi.localIP().toString().c_str());
+    // ── WiFi Manager ─────────────────────────────────────────
+    wifiMgr.setAPCredentials(String("Sensor-") + deviceId, "12345678");
+    wifiMgr.setTxPower(WIFI_POWER_11dBm);
+    wifiMgr.setTimeout(20);       // 20 сек на попытку
+    wifiMgr.setMaxRetries(3);     // 3 попытки → рескан → AP
+
+    wifiMgr.onConnect([]() {
         setupIds();
 #ifdef USE_MQTT
         mqttNeedsConnect = true;
 #endif
-        // closeAP(true) — не нужен, это поведение по умолчанию в конструкторе
     });
-    WiFiConnector.onError([]() {
-        const char* reason = "неизвестно";
-        switch (WiFi.status()) {
-            case WL_NO_SSID_AVAIL:   reason = "сеть не найдена"; break;
-            case WL_CONNECT_FAILED:  reason = "неверный пароль или отказ"; break;
-            case WL_CONNECTION_LOST: reason = "соединение потеряно"; break;
-            case WL_DISCONNECTED:    reason = "отключён"; break;
-        }
-        Serial.printf("[WiFi] Ошибка (%s), поднята AP: %s\n",
-            reason, WiFi.softAPIP().toString().c_str());
+    wifiMgr.onDisconnect([]() {
+#ifdef USE_MQTT
+        mqttNeedsConnect = false;
+        mqttClient.disconnect();
+#endif
+    });
+    wifiMgr.onError([](const char* reason) {
+        Serial.printf("[WiFi] Не удалось подключиться: %s\n", reason);
+    });
+    wifiMgr.onAPStart([]() {
+        Serial.printf("[WiFi] AP IP: %s\n", WiFi.softAPIP().toString().c_str());
     });
 
-    // Скан + подключение к лучшему AP
-    {
-        String ssid = (String)db[kk::wifi_ssid];
-        String pass = (String)db[kk::wifi_pass];
-        if (ssid.isEmpty()) {
-            // ssid = "YOUR_SSID";
-            // pass = "YOUR_PASS";
-        }
-
-        WiFiConnector.setName(String("Sensor-") + deviceId);
-        WiFiConnector.setPass("12345678");
-
-        // WiFi.mode() должен быть вызван ДО setTxPower — иначе мощность не применяется
-        WiFi.mode(WIFI_STA);
-        WiFi.setTxPower(WIFI_POWER_11dBm);
-
-        if (!ssid.isEmpty()) {
-            Serial.println("[WiFi] Сканирую сети...");
-            int n = WiFi.scanNetworks();
-            int bestIdx = -1; int bestRssi = -999;
-            for (int i = 0; i < n; i++) {
-                Serial.printf("  '%s' RSSI:%d BSSID:%s\n",
-                    WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.BSSIDstr(i).c_str());
-                if (WiFi.SSID(i) == ssid && WiFi.RSSI(i) > bestRssi) {
-                    bestRssi = WiFi.RSSI(i); bestIdx = i;
-                }
-            }
-            if (bestIdx >= 0) {
-                int     bestCh = WiFi.channel(bestIdx);
-                uint8_t bestBssid[6];
-                memcpy(bestBssid, WiFi.BSSID(bestIdx), 6);
-                Serial.printf("[WiFi] -> '%s' BSSID:%s ch:%d\n",
-                    ssid.c_str(), WiFi.BSSIDstr(bestIdx).c_str(), bestCh);
-                WiFi.scanDelete();
-                WiFiConnector.connect(ssid, pass);
-                // setTxPower снова — WiFiConnector.connect() меняет режим на AP_STA
-                WiFi.setTxPower(WIFI_POWER_11dBm);
-                WiFi.begin(ssid.c_str(), pass.c_str(), bestCh, bestBssid);
-            } else {
-                Serial.printf("[WiFi] '%s' не найдена, поднимаю AP\n", ssid.c_str());
-                WiFi.scanDelete();
-                WiFiConnector.connect("", "");
-                WiFi.setTxPower(WIFI_POWER_11dBm);
-            }
-        } else {
-            WiFiConnector.connect("", "");
-            WiFi.setTxPower(WIFI_POWER_11dBm);
-        }
-    }
+    wifiMgr.begin((String)db[kk::wifi_ssid], (String)db[kk::wifi_pass]);
 
     sett.setTitle(String("Sensor-") + deviceId);
     sett.onBuild(buildUI);
@@ -617,13 +575,13 @@ static unsigned long timerUiUpdate = 0;
 void loop() {
     delay(1);  // FreeRTOS idle
 
-    WiFiConnector.tick();
+    wifiMgr.tick();
     sett.tick();
 
-    // AP статус пока нет WiFi
-    if (!WiFiConnector.connected() && millis() - timerApLog >= 1000) {
+    // Лог статуса раз в секунду пока нет STA-соединения
+    if (!wifiMgr.connected() && millis() - timerApLog >= 1000) {
         timerApLog = millis();
-        if (WiFiConnector.connecting()) {
+        if (wifiMgr.connecting()) {
             Serial.printf("[WiFi] Подключаюсь... (%lus)\n", millis() / 1000);
         } else {
             Serial.printf("[AP] http://%s  (Sensor-%s / 12345678)\n",
@@ -631,7 +589,7 @@ void loop() {
         }
     }
 
-    if (!WiFiConnector.connected()) return;
+    if (!wifiMgr.connected()) return;
 
     unsigned long now = millis();
 
