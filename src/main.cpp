@@ -612,25 +612,19 @@ void loop() {
         String vDoorOut = snap.doorOpen ? "АКТИВЕН" : "неактивен";
         String vLd2410  = ld2410Failed  ? "ОШИБКА: датчик не отвечает" : "OK";
 
-        db[kk::lbl_wifi]    = vWifi;
-        db[kk::lbl_ld2410]  = vLd2410;
-        db[kk::lbl_mov_dist]= vDist;
-        db[kk::lbl_door]    = vDir;
-        db[kk::lbl_presence]= vDoorOut;
-
-        auto upd = sett.updater()
-            .update(kk::lbl_wifi,     vWifi)
-            .update(kk::lbl_ld2410,   vLd2410)
-            .update(kk::lbl_mov_dist, vDist)
-            .update(kk::lbl_door,     vDir)
-            .update(kk::lbl_presence, vDoorOut);
+        // ── Собираем все строки ДО вызова updater ───────────────
+        // ВАЖНО: не сохранять результат updater().update() в auto upd.
+        // Updater хранит Packet& p (ссылку на член InlineUpdater).
+        // При копировании/захвате Updater ссылка становится dangling
+        // (InlineUpdater-временный уничтожается в конце выражения) →
+        // следующий вызов upd.update() обращается к мёртвому объекту →
+        // BSON пишет по мусорному адресу → Core 0 panic.
+        // Решение: все апдейты — одна цепочка до точки с запятой.
 
 #ifdef USE_MQTT
         String vMqtt = mqttClient.connected() ? "подключён" : "отключён";
         db[kk::lbl_mqtt] = vMqtt;
-        upd.update(kk::lbl_mqtt, vMqtt);
 #endif
-
 #ifdef USE_VL53
         String vVl53 = !vl53ok
             ? "ОШИБКА: датчик не найден при старте"
@@ -640,9 +634,28 @@ void loop() {
         String vZoneOut = snap.zoneBlocked ? "АКТИВЕН" : "неактивен";
         db[kk::lbl_vl53]   = vVl53;
         db[kk::lbl_static] = vZoneOut;
-        upd.update(kk::lbl_vl53,   vVl53)
-           .update(kk::lbl_static, vZoneOut);
 #endif
+        db[kk::lbl_wifi]    = vWifi;
+        db[kk::lbl_ld2410]  = vLd2410;
+        db[kk::lbl_mov_dist]= vDist;
+        db[kk::lbl_door]    = vDir;
+        db[kk::lbl_presence]= vDoorOut;
+
+        // ── Одна цепочка — InlineUpdater живёт до точки с запятой ──
+        sett.updater()
+            .update(kk::lbl_wifi,     vWifi)
+            .update(kk::lbl_ld2410,   vLd2410)
+            .update(kk::lbl_mov_dist, vDist)
+            .update(kk::lbl_door,     vDir)
+            .update(kk::lbl_presence, vDoorOut)
+#ifdef USE_MQTT
+            .update(kk::lbl_mqtt,     vMqtt)
+#endif
+#ifdef USE_VL53
+            .update(kk::lbl_vl53,     vVl53)
+            .update(kk::lbl_static,   vZoneOut)
+#endif
+            ;
     }
 
 #ifdef USE_MQTT
