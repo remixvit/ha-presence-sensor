@@ -506,7 +506,7 @@ void setup() {
 #ifdef USE_MQTT
         mqttNeedsConnect = true;
 #endif
-        WiFiConnector.closeAP(true);
+        // closeAP(true) — не нужен, это поведение по умолчанию в конструкторе
     });
     WiFiConnector.onError([]() {
         const char* reason = "неизвестно";
@@ -529,9 +529,12 @@ void setup() {
             // pass = "YOUR_PASS";
         }
 
-        WiFi.setTxPower(WIFI_POWER_11dBm);
         WiFiConnector.setName(String("Sensor-") + deviceId);
         WiFiConnector.setPass("12345678");
+
+        // WiFi.mode() должен быть вызван ДО setTxPower — иначе мощность не применяется
+        WiFi.mode(WIFI_STA);
+        WiFi.setTxPower(WIFI_POWER_11dBm);
 
         if (!ssid.isEmpty()) {
             Serial.println("[WiFi] Сканирую сети...");
@@ -552,14 +555,18 @@ void setup() {
                     ssid.c_str(), WiFi.BSSIDstr(bestIdx).c_str(), bestCh);
                 WiFi.scanDelete();
                 WiFiConnector.connect(ssid, pass);
+                // setTxPower снова — WiFiConnector.connect() меняет режим на AP_STA
+                WiFi.setTxPower(WIFI_POWER_11dBm);
                 WiFi.begin(ssid.c_str(), pass.c_str(), bestCh, bestBssid);
             } else {
                 Serial.printf("[WiFi] '%s' не найдена, поднимаю AP\n", ssid.c_str());
                 WiFi.scanDelete();
                 WiFiConnector.connect("", "");
+                WiFi.setTxPower(WIFI_POWER_11dBm);
             }
         } else {
             WiFiConnector.connect("", "");
+            WiFi.setTxPower(WIFI_POWER_11dBm);
         }
     }
 
