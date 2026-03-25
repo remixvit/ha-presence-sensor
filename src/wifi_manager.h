@@ -61,6 +61,17 @@ public:
 
     // ── tick() — вызывать в loop() ──────────────────────────
     void tick() {
+        // Отложенное закрытие AP — даём WebSocket клиентам закрыться штатно.
+        // softAPdisconnect() убивает TCP на уровне железа мгновенно;
+        // если сделать это сразу, sett (WebSocket) обращается к невалидным
+        // сокетам → BSON пишет по мусорному адресу → Core 0 panic.
+        if (_closeAPAt && millis() >= _closeAPAt) {
+            _closeAPAt = 0;
+            WiFi.softAPdisconnect(true);
+            _apActive = false;
+            Serial.println("[WiFi] AP закрыта");
+        }
+
         if (_state != State::Connecting) return;
 
         wl_status_t status = WiFi.status();
@@ -140,6 +151,7 @@ private:
 
     uint32_t     _timeout      = 20000;    // 20 сек на попытку
     uint32_t     _connectStart = 0;
+    uint32_t     _closeAPAt    = 0;        // отложенное закрытие AP (мс)
     wifi_power_t _txPower      = WIFI_POWER_11dBm;
     State        _state        = State::Idle;
     bool         _apActive     = false;
@@ -218,15 +230,10 @@ private:
 
     void _closeAP() {
         if (!_apActive) return;
-        // НЕ меняем WiFi.mode() здесь — на ESP32-C3 один физический
-        // процессор, вызов mode() из loop() пока WiFi-стек обрабатывает
-        // события connect приводит к Store access fault (Core 0 panic).
-        // softAPdisconnect(true) физически останавливает AP,
-        // режим AP_STA остаётся — это нормально.
-        WiFi.softAPdisconnect(true);
-        WiFi.setTxPower(_txPower);
-        _apActive = false;
-        Serial.println("[WiFi] AP закрыта");
+        // Закрываем AP с задержкой 3 сек — даём WebSocket/sett успеть
+        // закрыть соединения штатно до того как lwIP уберёт интерфейс.
+        _closeAPAt = millis() + 3000;
+        Serial.println("[WiFi] AP будет закрыта через 3 сек...");
     }
 
     static const char* _statusStr(wl_status_t s) {
